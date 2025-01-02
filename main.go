@@ -28,6 +28,39 @@ type SlackResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
+func sendReactionMessage(reaction, threadTs string) {
+	SLACK_API_URL := "https://slack.com/api/reactions.add"
+	slackToken := os.Getenv("SLACK_TOKEN")
+
+	data := map[string]string{
+		"name":      reaction,
+		"channel":   os.Getenv("CHANNEL_ID"),
+		"timestamp": threadTs,
+	}
+
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("Failed to marshal JSON for reaction: %v", err)
+		return
+	}
+
+	req, err := http.NewRequest("POST", SLACK_API_URL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Printf("Failed to create request for reaction: %v", err)
+		return
+	}
+
+	req.Header.Set("Authorization", "Bearer "+slackToken)
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+}
+
 func sendSlackMessage(text, threadTs string) string {
 	SLACK_API_URL := os.Getenv("SLACK_API_URL")
 	data := SlackRequestBody{
@@ -148,15 +181,20 @@ func processLogs(ipAddress string, filePath string, maxRequests int, parentTs st
 	if err != nil {
 		log.Fatalf("Error reading file: %v", err)
 	}
+	additionalMaxRequestsWpContentStr := os.Getenv("ADDITIONAL_MAX_REQUESTS_WPCONTENT")
+	additionalMaxRequestsWpContent, err := strconv.Atoi(additionalMaxRequestsWpContentStr)
 
 	currentTime := time.Now().UTC()
 	oneHourAgo := currentTime.Add(-1 * time.Hour)
 
 	ipRegex := regexp.MustCompile(fmt.Sprintf(`^%s -`, ipAddress))
+
+	wpContentRegex := regexp.MustCompile(`/wp-content/`)
 	lines := strings.Split(string(content), "\n")
 
 	var filteredLogs []string
 	requestsBySecond := make(map[int]int)
+	wpContentSeconds := make(map[int]bool)
 	dotEnvAlerted := false
 	sleepAlerted := false
 	manyRequestsAlerted := false
@@ -172,7 +210,14 @@ func processLogs(ipAddress string, filePath string, maxRequests int, parentTs st
 						epochSecond := int(logTime.Unix())
 						requestsBySecond[epochSecond]++
 
-						if requestsBySecond[epochSecond] >= maxRequests && !manyRequestsAlerted {
+						if wpContentRegex.MatchString(line) {
+							wpContentSeconds[epochSecond] = true
+						}
+						currentMaxRequests := maxRequests
+						if wpContentSeconds[epochSecond] {
+							currentMaxRequests = additionalMaxRequestsWpContent + maxRequests
+						}
+						if requestsBySecond[epochSecond] >= currentMaxRequests && !manyRequestsAlerted {
 							manyRequestAlert := fmt.Sprintf("‼️ ‼️ ALERT for IP %s: Requests exceeded threshold. Count: %d", ipAddress, requestsBySecond[epochSecond])
 							manyRequestsAlerted = true
 							sendSlackMessage(manyRequestAlert, parentTs)
@@ -193,7 +238,13 @@ func processLogs(ipAddress string, filePath string, maxRequests int, parentTs st
 			}
 		}
 	}
-
+	if dotEnvAlerted || sleepAlerted || manyRequestsAlerted {
+		reaction := os.Getenv("SLACK_EMOJI_BAN")
+		sendReactionMessage(reaction, parentTs)
+	} else {
+		reaction := os.Getenv("SLACK_EMOJI_NOT_BAN")
+		sendReactionMessage(reaction, parentTs)
+	}
 	if len(filteredLogs) > 0 {
 		logMessage := processLogsUnique(filteredLogs)
 		sendSlackMessage(logMessage, parentTs)
@@ -230,7 +281,7 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
-	
+
 	mainMessageTs := sendSlackMessage(fmt.Sprintf("Site %s. Suspicious IP detected: %s", nameSite, ipAddress), "")
 
 	wg.Add(1)
