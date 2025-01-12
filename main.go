@@ -28,6 +28,13 @@ type SlackResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
+type CloudflareResponse struct {
+	Success bool `json:"success"`
+	Errors  []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
+}
+
 func sendReactionMessage(reaction, threadTs string) {
 	SLACK_API_URL := "https://slack.com/api/reactions.add"
 	slackToken := os.Getenv("SLACK_TOKEN")
@@ -140,6 +147,68 @@ func checkConditionContentSleep(log string) bool {
 	return re.MatchString(log)
 }
 
+func BanIP(ip string) (bool, string) {
+	cfZoneID := os.Getenv("CF_ZONE_ID")
+	cfEmail := os.Getenv("CF_EMAIL")
+	cfApiKey := os.Getenv("CF_API_KEY")
+
+	if cfZoneID == "" || cfEmail == "" || cfApiKey == "" {
+		return false, "Cloudflare API credentials are not set in .env"
+	}
+	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/firewall/access_rules/rules", cfZoneID)
+	headers := map[string]string{
+		"X-Auth-Email": cfEmail,
+		"X-Auth-Key":   cfApiKey,
+		"Content-Type": "application/json",
+	}
+	data := map[string]interface{}{
+		"mode": "block",
+		"configuration": map[string]string{
+			"target": "ip",
+			"value":  ip,
+		},
+		"notes": fmt.Sprintf("Banned by Fail2Ban morannon"),
+	}
+	payloadBytes, err := json.Marshal(data)
+	if err != nil {
+		return false, fmt.Sprintf("Error marshalling JSON payload: %v", err)
+	}
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		return false, fmt.Sprintf("Error creating HTTP request: %v", err)
+	}
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, fmt.Sprintf("Error making HTTP request: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return false, fmt.Sprintf("Error reading response body: %v", err)
+	}
+
+	var cfResp CloudflareResponse
+	err = json.Unmarshal(body, &cfResp)
+	if err != nil {
+		return false, fmt.Sprintf("Error parsing Cloudflare response: %v", err)
+	}
+
+	if cfResp.Success {
+		return true, ""
+	}
+
+	errorMessage := "Unknown error from Cloudflare"
+	if len(cfResp.Errors) > 0 {
+		errorMessage = cfResp.Errors[0].Message
+	}
+
+	return false, errorMessage
+}
 func processLogsUnique(filteredLogs []string) string {
 	logsByMinute := make(map[string][]string)
 
@@ -238,11 +307,22 @@ func processLogs(ipAddress string, filePath string, maxRequests int, parentTs st
 			}
 		}
 	}
+	reaction := os.Getenv("SLACK_EMOJI_BAN")
 	if dotEnvAlerted || sleepAlerted || manyRequestsAlerted {
-		reaction := os.Getenv("SLACK_EMOJI_BAN")
+		success, errMsg := BanIP(ipAddress)
+		banlogMessage := ""
+		if success {
+			banlogMessage = fmt.Sprintf("IP %s has been successfully blocked in Cloudflare..\n", ipAddress)
+			sendSlackMessage(banlogMessage, parentTs)
+		} else {
+			reaction = os.Getenv("SLACK_EMOJI_FAIL_BAN")
+			banlogMessage = fmt.Sprintf("Failed to block the IP %s: %s\n", ipAddress, errMsg)
+		}
+		sendSlackMessage(banlogMessage, parentTs)
+
 		sendReactionMessage(reaction, parentTs)
 	} else {
-		reaction := os.Getenv("SLACK_EMOJI_NOT_BAN")
+		reaction = os.Getenv("SLACK_EMOJI_NOT_BAN")
 		sendReactionMessage(reaction, parentTs)
 	}
 	if len(filteredLogs) > 0 {
@@ -264,13 +344,11 @@ func main() {
 		log.Fatal("Usage: go run main.go <IP_ADDRESS>")
 	}
 
-	ipAddress := os.Args[1]
 	slackToken := os.Getenv("SLACK_TOKEN")
 	channelID := os.Getenv("CHANNEL_ID")
 	filePath := os.Getenv("FILE_PATH")
 	nameSite := os.Getenv("SITE_NAME")
 	maxRequestsSecond := os.Getenv("MAX_REQUESTS_SECOND")
-
 	if slackToken == "" || channelID == "" || filePath == "" || maxRequestsSecond == "" {
 		log.Fatal("Required environment variables are not set")
 	}
@@ -279,15 +357,23 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error converting MAX_REQUESTS_SECOND to integer: %v", err)
 	}
+	actionMorannon := os.Args[1]
 
-	var wg sync.WaitGroup
+	if actionMorannon == "start" {
+		sendSlackMessage(fmt.Sprintf("Site %s. Start fail2ban-morannon", nameSite), "")
 
-	mainMessageTs := sendSlackMessage(fmt.Sprintf("Site %s. Suspicious IP detected: %s", nameSite, ipAddress), "")
+	} else if actionMorannon == "ban" {
+		ipAddress := os.Args[2]
+		var wg sync.WaitGroup
+		mainMessageTs := sendSlackMessage(fmt.Sprintf("Site %s. Suspicious IP detected: %s", nameSite, ipAddress), "")
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		processLogs(ipAddress, filePath, maxRequests, mainMessageTs)
-	}()
-	wg.Wait()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			processLogs(ipAddress, filePath, maxRequests, mainMessageTs)
+		}()
+		wg.Wait()
+
+	}
+
 }
