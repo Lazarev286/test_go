@@ -16,6 +16,11 @@ import (
 	"time"
 )
 
+var (
+	queue = make(chan string, 1000)
+	wg    sync.WaitGroup
+)
+
 type SlackRequestBody struct {
 	Channel  string `json:"channel"`
 	Text     string `json:"text"`
@@ -246,6 +251,7 @@ func processLogsUnique(filteredLogs []string) string {
 }
 
 func processLogs(ipAddress string, filePath string, maxRequests int, parentTs string) {
+	fmt.Printf("%s|%s", ipAddress, parentTs)
 	content, err := ioutil.ReadFile(filePath)
 	if err != nil {
 		log.Fatalf("Error reading file: %v", err)
@@ -253,17 +259,22 @@ func processLogs(ipAddress string, filePath string, maxRequests int, parentTs st
 	additionalMaxRequestsWpContentStr := os.Getenv("ADDITIONAL_MAX_REQUESTS_WPCONTENT")
 	additionalMaxRequestsWpContent, err := strconv.Atoi(additionalMaxRequestsWpContentStr)
 
+	additionalMaxRequestsWpIncludesStr := os.Getenv("ADDITIONAL_MAX_REQUESTS_WP_INCLUDES")
+	additionalMaxRequestsWpIncludes, _ := strconv.Atoi(additionalMaxRequestsWpIncludesStr)
+
 	currentTime := time.Now().UTC()
 	oneHourAgo := currentTime.Add(-1 * time.Hour)
 
 	ipRegex := regexp.MustCompile(fmt.Sprintf(`^%s -`, ipAddress))
 
 	wpContentRegex := regexp.MustCompile(`/wp-content/`)
+	wpIncludesRegex := regexp.MustCompile(`/wp-includes/`)
 	lines := strings.Split(string(content), "\n")
 
 	var filteredLogs []string
 	requestsBySecond := make(map[int]int)
 	wpContentSeconds := make(map[int]bool)
+	wpIncludesSeconds := make(map[int]bool)
 	dotEnvAlerted := false
 	sleepAlerted := false
 	manyRequestsAlerted := false
@@ -281,10 +292,14 @@ func processLogs(ipAddress string, filePath string, maxRequests int, parentTs st
 
 						if wpContentRegex.MatchString(line) {
 							wpContentSeconds[epochSecond] = true
+						} else if wpIncludesRegex.MatchString(line) {
+							wpIncludesSeconds[epochSecond] = true
 						}
 						currentMaxRequests := maxRequests
 						if wpContentSeconds[epochSecond] {
 							currentMaxRequests = additionalMaxRequestsWpContent + maxRequests
+						} else if wpIncludesSeconds[epochSecond] {
+							currentMaxRequests = additionalMaxRequestsWpIncludes + maxRequests
 						}
 						if requestsBySecond[epochSecond] >= currentMaxRequests && !manyRequestsAlerted {
 							manyRequestAlert := fmt.Sprintf("‼️ ‼️ ALERT for IP %s: Requests exceeded threshold. Count: %d", ipAddress, requestsBySecond[epochSecond])
@@ -340,10 +355,6 @@ func main() {
 		log.Fatalf("Error loading .env file: %v", err)
 	}
 
-	if len(os.Args) < 2 {
-		log.Fatal("Usage: go run main.go <IP_ADDRESS>")
-	}
-
 	slackToken := os.Getenv("SLACK_TOKEN")
 	channelID := os.Getenv("CHANNEL_ID")
 	filePath := os.Getenv("FILE_PATH")
@@ -353,27 +364,31 @@ func main() {
 		log.Fatal("Required environment variables are not set")
 	}
 
-	maxRequests, err := strconv.Atoi(maxRequestsSecond)
-	if err != nil {
-		log.Fatalf("Error converting MAX_REQUESTS_SECOND to integer: %v", err)
-	}
-	actionMorannon := os.Args[1]
+	go worker()
 
-	if actionMorannon == "start" {
-		sendSlackMessage(fmt.Sprintf("Site %s. Start fail2ban-morannon", nameSite), "")
+	ipAddress := os.Args[2]
+	mainMessageTs := sendSlackMessage(fmt.Sprintf("Site %s. Suspicious IP detected: %s", nameSite, ipAddress), "")
+	wg.Add(1)
+	queue <- fmt.Sprintf("%s|%s", ipAddress, mainMessageTs)
 
-	} else if actionMorannon == "ban" {
-		ipAddress := os.Args[2]
-		var wg sync.WaitGroup
-		mainMessageTs := sendSlackMessage(fmt.Sprintf("Site %s. Suspicious IP detected: %s", nameSite, ipAddress), "")
+	wg.Wait()
 
-		wg.Add(1)
-		go func() {
+}
+func worker() {
+	filePath := os.Getenv("FILE_PATH")
+	maxRequestsSecond := os.Getenv("MAX_REQUESTS_SECOND")
+	maxRequests, _ := strconv.Atoi(maxRequestsSecond)
+
+	for item := range queue {
+		data := parseQueueItem(item)
+		ipAddress, mainMessageTs := data[0], data[1]
+
+		go func(ip, ts string) {
 			defer wg.Done()
-			processLogs(ipAddress, filePath, maxRequests, mainMessageTs)
-		}()
-		wg.Wait()
-
+			processLogs(ip, filePath, maxRequests, ts)
+		}(ipAddress, mainMessageTs)
 	}
-
+}
+func parseQueueItem(item string) []string {
+	return strings.Split(item, "|")
 }
