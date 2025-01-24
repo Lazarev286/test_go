@@ -152,6 +152,16 @@ func checkConditionContentSleep(log string) bool {
 	return re.MatchString(log)
 }
 
+func checkConditionContentStatic(log string) bool {
+	extensions := []string{".png", ".webp", ".jpg", ".ico"}
+	for _, ext := range extensions {
+		if strings.Contains(log, ext) {
+			return true
+		}
+	}
+	return false
+}
+
 func BanIP(ip string) (bool, string) {
 	cfZoneID := os.Getenv("CF_ZONE_ID")
 	cfEmail := os.Getenv("CF_EMAIL")
@@ -251,7 +261,6 @@ func processLogsUnique(filteredLogs []string) string {
 }
 
 func processLogs(ipAddress string, filePath string, maxRequests int, parentTs string) {
-	fmt.Printf("%s|%s", ipAddress, parentTs)
 	content, err := ioutil.ReadFile(filePath)
 	if err != nil {
 		log.Fatalf("Error reading file: %v", err)
@@ -261,6 +270,9 @@ func processLogs(ipAddress string, filePath string, maxRequests int, parentTs st
 
 	additionalMaxRequestsWpIncludesStr := os.Getenv("ADDITIONAL_MAX_REQUESTS_WP_INCLUDES")
 	additionalMaxRequestsWpIncludes, _ := strconv.Atoi(additionalMaxRequestsWpIncludesStr)
+
+	additionalMaxRequestsImagesStaticStr := os.Getenv("ADDITIONAL_MAX_REQUESTS_IMAGES_STATIC")
+	additionalMaxRequestsImagesStatic, _ := strconv.Atoi(additionalMaxRequestsImagesStaticStr)
 
 	currentTime := time.Now().UTC()
 	oneHourAgo := currentTime.Add(-1 * time.Hour)
@@ -275,6 +287,7 @@ func processLogs(ipAddress string, filePath string, maxRequests int, parentTs st
 	requestsBySecond := make(map[int]int)
 	wpContentSeconds := make(map[int]bool)
 	wpIncludesSeconds := make(map[int]bool)
+	staticImagesSeconds := make(map[int]bool)
 	dotEnvAlerted := false
 	sleepAlerted := false
 	manyRequestsAlerted := false
@@ -294,12 +307,16 @@ func processLogs(ipAddress string, filePath string, maxRequests int, parentTs st
 							wpContentSeconds[epochSecond] = true
 						} else if wpIncludesRegex.MatchString(line) {
 							wpIncludesSeconds[epochSecond] = true
+						} else if checkConditionContentStatic(line) {
+							staticImagesSeconds[epochSecond] = true
 						}
 						currentMaxRequests := maxRequests
 						if wpContentSeconds[epochSecond] {
 							currentMaxRequests = additionalMaxRequestsWpContent + maxRequests
 						} else if wpIncludesSeconds[epochSecond] {
 							currentMaxRequests = additionalMaxRequestsWpIncludes + maxRequests
+						} else if staticImagesSeconds[epochSecond] {
+							currentMaxRequests = additionalMaxRequestsImagesStatic + maxRequests
 						}
 						if requestsBySecond[epochSecond] >= currentMaxRequests && !manyRequestsAlerted {
 							manyRequestAlert := fmt.Sprintf("‼️ ‼️ ALERT for IP %s: Requests exceeded threshold. Count: %d", ipAddress, requestsBySecond[epochSecond])
